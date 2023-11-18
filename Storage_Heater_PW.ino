@@ -3,25 +3,21 @@
   James Fotherby 3rd November 2022
 
   Description:
-  This code runs on the Adafruit ESP32 Feather. It has 3 thermistor inputs and 3 outputs (A relay that switches on/off the immersion heater, a circulating pump and a fan) 
-  The fan and pump speed can be modulated via PWM.
+  This code runs on the Adafruit ESP32 Feather. It has 3 thermistor inputs and 3 outputs: 
+    1) A relay that switches on/off the immersion heater
+    2) A circulating pump - speed can be modulated via PWM
+    3) A fan - speed can be modulated via PWM
 
   The ESP keeps an uptodate time using NTP
-  During off peak electricity hours it heats up the water by turning the pump and immersion heater on.
+  During off peak electricity hours it heats up a water tank by turning the pump and immersion heater on.
   During on peak hours we run a PI controller to maintain a fixed heat power output - we adjust the pump and fan speeds to do this
 
   It's a little bit more complicated in reality:
-  1)  We want to run the pump as slow as possible during heat up time so the water remains stratified and little noise is made.
-      This is done by monitoring the water output temp and modulating the pump speed to maintain a setpoint of 80C during the heat up phase.
+  1)  When heating up the water tank we want to run the pump as slow as possible so the water remains stratified.
+      This is done by monitoring the water output temp and modulating the pump speed to maintain a setpoint of ~80C.
 
-  2)  During daytime we run a PI to adjust the pump speed which determines the flow rate through the water to air heat exchanger.
-      When the tank is very hot - the pump would have to run too slowly so instead we pulse it on/off according to duty cycle
-      When the tank is medium hot we can run the pump continuously and adjust it's speed
-      When the tank is only warm we're unable to maintain our fixed power output so it's an exponential decay from there on
-      After 6 hours of expo decay we shutdown.
-
-To Do:
-- allow system to be switched on/off
+  2)  When releasing heat we run a PI controller to adjust the pump speed (ie. flow rate) through the water to air heat exchanger.
+      When the tank is very hot - the pump would have to run too slowly so instead we pulse it on/off according to a duty cycle
 */
 
 #include <MovingAverage.h>
@@ -52,27 +48,27 @@ To Do:
 #define THERMISTORNOMINAL         10000
 #define TEMPERATURENOMINAL        25 
 
-#define MIN_Pump_Startup          100
-#define STARTUP_WATER_FLOW_RATE   10
+#define MIN_Pump_Startup          440
+#define STARTUP_WATER_FLOW_RATE   40
 
 #define TWENTY_SECONDS            200
 #define ONE_MINUTE                600
 #define FIVE_MINUTES              3000
 #define TEN_MINUTES               6000
-#define ONE_HOUR                  36000
+#define FOUR_HOURS                144000
 
 #define HEAT_UP_TIME              1
-#define HOLD_HEAT                 2
-#define RELEASE_HEAT              3
+#define RELEASE_HEAT              2
 
 #define PWM_Freq                  10000
-#define PWM_Resolution            8
+#define PWM_Resolution            10
 
 #define Fan_PWM_Ch                0
 #define Pump_PWM_Ch               1
 
 #define WATER_SETPOINT            82.0
-#define AIR_SETPOINT              17.5  
+#define AIR_SETPOINT              15.0
+#define AIR_SETPOINT_SLEEP        5.0  
 
 //--------------------------------------
 float Convert_to_temperature(uint16_t Thermistor_ADC_Value, uint16_t Pullup_Resistance);
@@ -82,20 +78,19 @@ void Save_Influx_Point(float T_Air_In, float T_Air_Out, float T_Water_Out, float
 void setTimezone(String timezone);
 void initTime(String timezone);
 
-float Air_In_Temp;
-float Air_Out_Temp;
+float Air_In_Temp, Air_Out_Temp;
 
 MovingAverage <uint16_t, 8> Air_In_Temp_Filter;
 MovingAverage <uint16_t, 8> Air_Out_Temp_Filter;
 MovingAverage <uint16_t, 8> Water_Out_Temp_Filter;
 
 double    Setpoint_Water_Temp, Measured_Water_Temp, Pump_Speed;
-double    Pump_Kp=0.0, Pump_Ki=0.02, Pump_Kd=0.0;
-PID       Pump_PID(&Measured_Water_Temp, &Pump_Speed, &Setpoint_Water_Temp, Pump_Kp, Pump_Ki, Pump_Kd, REVERSE);
+double    Pump_Kp=4.0, Pump_Ki=0.05, Pump_Kd=0.0;
+PID       Heat_up_Pump_PI(&Measured_Water_Temp, &Pump_Speed, &Setpoint_Water_Temp, Pump_Kp, Pump_Ki, Pump_Kd, REVERSE);
 
 double    Setpoint_Air_Differential, Air_Differential, Water_flow_rate;
 double    Heating_PID_Kp=0.1, Heating_PID_Ki=0.05, Heating_PID_Kd=0.0;
-PID       Heating_PID(&Air_Differential, &Water_flow_rate, &Setpoint_Air_Differential, Heating_PID_Kp, Heating_PID_Ki, Heating_PID_Kd, DIRECT);
+PID       Heat_release_Pump_PI(&Air_Differential, &Water_flow_rate, &Setpoint_Air_Differential, Heating_PID_Kp, Heating_PID_Ki, Heating_PID_Kd, DIRECT);
 
 WiFiMulti       wifiMulti;
 InfluxDBClient  client(INFLUXDB_URL, INFLUXDB_DB_NAME);
@@ -104,16 +99,14 @@ Point           sensor("Storage_Heater");
 //#########################################################################################################################################################################
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void setup() {
-  Pump_PID.SetOutputLimits(70,120);   
-  Pump_PID.SetSampleTime(200);
+  Heat_up_Pump_PI.SetOutputLimits(288,480);   
+  Heat_up_Pump_PI.SetSampleTime(200);
   Setpoint_Water_Temp = WATER_SETPOINT;
   Pump_Speed = MIN_Pump_Startup;  
 
-  Heating_PID.SetOutputLimits(5,111);
-  Heating_PID.SetSampleTime(200);
-  Setpoint_Air_Differential = AIR_SETPOINT;
+  Heat_release_Pump_PI.SetOutputLimits(16,304);
+  Heat_release_Pump_PI.SetSampleTime(200);
   Water_flow_rate = STARTUP_WATER_FLOW_RATE;
-  Heating_PID.SetMode(AUTOMATIC);
   
   Serial.begin(115200);
   startWifi();
@@ -139,7 +132,7 @@ void setup() {
 //#########################################################################################################################################################################
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void loop() {
-  static uint16_t Heater_MODE = HOLD_HEAT;
+  static uint16_t Heater_MODE = RELEASE_HEAT;
   static float Avg_Water_flow_rate;
   static uint32_t Temperature_Reached_Count = 0, Heat_Depleted_Count = 0, Log_Data_Count = 0;
 
@@ -153,9 +146,9 @@ void loop() {
   }
 
   // Convert these ADC values into floating point temperatures
-  Air_In_Temp = Convert_to_temperature(Air_In_Temp_Filter.get(), 10000) - 8.4;
-  Air_Out_Temp = Convert_to_temperature(Air_Out_Temp_Filter.get(), 10000) - 5.4;
-  Measured_Water_Temp = Convert_to_temperature(Water_Out_Temp_Filter.get(), 4700) - 2.5;
+  Air_In_Temp = Convert_to_temperature(Air_In_Temp_Filter.get(), 10000);
+  Air_Out_Temp = Convert_to_temperature(Air_Out_Temp_Filter.get(), 10000);
+  Measured_Water_Temp = Convert_to_temperature(Water_Out_Temp_Filter.get(), 4700);
 
   // Get the current time and set Off_Peak_Time
   struct tm timeinfo;
@@ -164,7 +157,8 @@ void loop() {
   }
   else  {
     Serial.println(&timeinfo, "%H:%M");
-
+    Setpoint_Air_Differential = AIR_SETPOINT_SLEEP;
+    
     if(timeinfo.tm_hour == 0 && timeinfo.tm_min >= 30) {
       Heater_MODE = HEAT_UP_TIME;
     }
@@ -175,13 +169,11 @@ void loop() {
       Heater_MODE = HEAT_UP_TIME;
     }
     else if(timeinfo.tm_hour == 4 && timeinfo.tm_min >= 30) {
-      Heater_MODE = HOLD_HEAT;
-    }
-    else if(timeinfo.tm_hour == 5)  {
-      Heater_MODE = HOLD_HEAT;
+      Heater_MODE = RELEASE_HEAT;
     }
     else  {      
       Heater_MODE = RELEASE_HEAT;
+      Setpoint_Air_Differential = AIR_SETPOINT;
     }
   }
 
@@ -207,16 +199,13 @@ void loop() {
       digitalWrite(L298_Relay_Pin, HIGH);                                             // This switches on the immersion heater 
     }
 
-    Pump_PID.SetMode(AUTOMATIC);
-    ledcWrite(Fan_PWM_Ch, 95);                                                        // Medium fan speed to allow for pump input temp to be approximated and to cool enclosure
+    Heat_up_Pump_PI.SetMode(AUTOMATIC);
+    Heat_release_Pump_PI.SetMode(MANUAL);
+    ledcWrite(Fan_PWM_Ch, 432);                                                       // fan to allow for pump input temp to be approximated and to cool enclosure
     Heat_Depleted_Count = 0;
     Water_flow_rate = STARTUP_WATER_FLOW_RATE;                                        // Reset this for when we enter heat release mode.
-    Pump_PID.Compute();                                                               // Iterate the PI controller based on the water output temp and setpoint.
-    
-    if(Measured_Water_Temp > 85.0) {                                                  // If the water out temp gets too hot we increase flow quickly
-      Pump_Speed += 0.1;                                                              // Increase pump speed by 1/second
-    }   
-    
+  
+    Heat_up_Pump_PI.Compute();                                                        // Iterate the PI controller based on the water output temp and setpoint. 
     ledcWrite(Pump_PWM_Ch, round(Pump_Speed));                                        // Update the pump speed based on the PI controller   
 
     if(Air_Out_Temp > 45 || Measured_Water_Temp > 84)  {                              // Air_Out_Temp approximates the pump input temperature. (Don't want this too hot)
@@ -228,99 +217,79 @@ void loop() {
       }
     }
 
-    Serial.print("PS: "); Serial.println(Pump_Speed);
-    Avg_Water_flow_rate = float(Pump_Speed); 
+    Avg_Water_flow_rate = (float)(Pump_Speed / 4.0); 
   }
-  else if(Heater_MODE == HEAT_UP_TIME || Heater_MODE == HOLD_HEAT)                    // It's still off peak time but we have a fully heated storage tank.
-  {
-    digitalWrite(L298_Relay_Pin, LOW);                                                // Ensure immersion heater is off
-    ledcWrite(Pump_PWM_Ch, 0);                                                        // Switch pump off
-    ledcWrite(Fan_PWM_Ch, 0);                                                         // Fan off
-     
-    Serial.print("PS: "); Serial.println("0");    
-    Avg_Water_flow_rate = 0.0;                     
-  }
-  else                                                                                // It's heat release time  
+  else                                                                                // Either the tank is fully charged or it's heat release time  
   {
     digitalWrite(L298_Relay_Pin, LOW);                                                // Ensure immersion heater is off 
-    Pump_PID.SetMode(MANUAL);
-    Temperature_Reached_Count = 0;                                                    // Reset count    
-    Pump_Speed = MIN_Pump_Startup;                                                    // Ensure we start from this pump speed when we switch over to heatup mode                                               
+    Heat_up_Pump_PI.SetMode(MANUAL);
+    Heat_release_Pump_PI.SetMode(AUTOMATIC);
 
+    if(Heater_MODE != HEAT_UP_TIME) {
+      Temperature_Reached_Count = 0;                                                  // Reset count for the heat up phase   
+      Pump_Speed = MIN_Pump_Startup;                                                  // Ensure we start from this pump speed when we switch over to heatup mode 
+    }                                              
+  }
+
+  if(Heat_release_Pump_PI.GetMode() == AUTOMATIC)
+  {
     Air_Differential = Air_Out_Temp - Air_In_Temp;
-    Heating_PID.Compute();                                                            // This will output the required Water_flow_rate.
+    Heat_release_Pump_PI.Compute();                                                   // This will output the required Water_flow_rate.
 
     // The flow rate by the pump is approximately proportional to the voltage applied to the pump. Or in case of on/off control - the average voltage.
     static uint16_t Timer_Count = 0, On_Count = 0;
 
-    // State 0) No heat left in the tank - switch off everything 
-    if(Heat_Depleted_Count > ONE_HOUR)  {
+    // State 1) No heat left in the tank - switch off everything 
+    if(Heat_Depleted_Count > FOUR_HOURS)  {
       ledcWrite(Fan_PWM_Ch, 0);                                                    
       ledcWrite(Pump_PWM_Ch, 0);  
       Avg_Water_flow_rate = 0.0;    
     }
 
-    // State 1) Very little heat left in the tank - simply switch pump and fans on and let the heat come out according to an exponential decay   
-    else if(Heat_Depleted_Count > TEN_MINUTES)  {                                     // Tank temp must be very cool. This is the final heat release stage - expo decay 
-      Heat_Depleted_Count++;
-      ledcWrite(Fan_PWM_Ch, 130);                                                     // Very Fast fan speed to get the last bit of heat out
-      ledcWrite(Pump_PWM_Ch, 80);
-
-      if(Water_flow_rate < 110.0)  {                                                  // Can leave this state if we find the water input temperature has for some reason jumped up                 
-        Heat_Depleted_Count -= 10;                                                 
-      } 
-      Avg_Water_flow_rate = 80.0;    
-    }
-
     // State 2) Moderately warm tank - can modulate pump speed to maintain a fixed air differential temperature
-    else if(Water_flow_rate > 70.0 && On_Count > Timer_Count)  {                      // Tank must be medium temperature (pump must already be on to switch into this state)
-      ledcWrite(Fan_PWM_Ch, 105);                                                     // Medium fan speed                                   
+    else if(Water_flow_rate > 288.0 && On_Count > Timer_Count)  {                     // Tank must be medium temperature (pump must already be on to switch into this state)
+      ledcWrite(Fan_PWM_Ch, 430);                                                     // Medium fan speed                                   
       ledcWrite(Pump_PWM_Ch, round(Water_flow_rate));                                 // Can run pump slowly but continuously. Vary speed to maintain air differential temp
 
-      if(Water_flow_rate > 110.0)  {                                                  // If we are running the pump at near max speed for 10min, enter final state of heat release                 
+      if(Water_flow_rate > 303.9)  {                                                                  
         Heat_Depleted_Count++;                                                 
       }
-      else  {
-        if(Heat_Depleted_Count > 0) {
-          Heat_Depleted_Count--;
-        }
-      }
 
-      Avg_Water_flow_rate = float(Water_flow_rate);
+      Avg_Water_flow_rate = (float)(Water_flow_rate / 4.0);
     }
 
     // State 3) Tank very hot. Pump would have to run too slowly to run continuously so switch it on/off with a duty cycle that maintains the setpoint air temp differential
     else  {                                                                           // Tank must be very hot, we'll need to switch the pump on/off intermittently
-      On_Count = round(TWENTY_SECONDS * Water_flow_rate / 75.0);
+      On_Count = round(TWENTY_SECONDS * Water_flow_rate / 300.0);
       Timer_Count++;
       if(Timer_Count >= TWENTY_SECONDS)  {
         ledcWrite(Pump_PWM_Ch, MIN_Pump_Startup);
-        ledcWrite(Fan_PWM_Ch, 102);
+        ledcWrite(Fan_PWM_Ch, 440);
         Serial.println("P On Boost");
         Timer_Count = 0;
       }
-      else if(Timer_Count < 2)  {
-        ledcWrite(Pump_PWM_Ch, MIN_Pump_Startup);
+      else if(Timer_Count < 2)  {                                                     // This gives the pump high power for 200ms so it starts better
         Serial.println("P On Boost");
       }
       else if(On_Count >= Timer_Count)  {
-        ledcWrite(Pump_PWM_Ch, 70);
+        ledcWrite(Pump_PWM_Ch, 296);
         Serial.println("P On");
       }
       else  {
-        ledcWrite(Fan_PWM_Ch, 100);
+        ledcWrite(Fan_PWM_Ch, 434);                                                   // When the pump stops the supply voltage slightly rises so this compensates
         ledcWrite(Pump_PWM_Ch, 0);
         Serial.println("P Off");
       }
 
-      Avg_Water_flow_rate = float(Water_flow_rate);
-    }  
+      Avg_Water_flow_rate = (float)(Water_flow_rate / 4.0);
+    }      
     
-    Serial.print("WFR: "); Serial.print(Water_flow_rate); 
-    Serial.print(", AD: "); Serial.print(Air_Differential);
+    Serial.print("AD: "); Serial.print(Air_Differential);
+    Serial.print(", AD Setpoint: "); Serial.print(Setpoint_Air_Differential);
     Serial.print(", T: "); Serial.println(Heat_Depleted_Count/10);
   }
 
+  Serial.print("WFR: "); Serial.println(Avg_Water_flow_rate);                         // ranges from 4-76
   Serial.println();
 }
 
@@ -339,7 +308,7 @@ float Convert_to_temperature(uint16_t Thermistor_ADC_Value, uint16_t Pullup_Resi
   steinhart /= BCOEFFICIENT;                              // 1/B * ln(R/Ro)
   steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15);       // + (1/To)
   steinhart = 1.0 / steinhart;                            // Invert
-  steinhart -= 273.15;                                    // convert absolute temp to C
+  steinhart -= 278.0;                                    // convert absolute temp to C (together with a 5C fudge factor...)
 
   return(steinhart);
 }
@@ -449,6 +418,3 @@ void Save_Influx_Point(float T_Air_In, float T_Air_Out, float T_Water_Out, float
     Serial.println("Point added to database");
   }
 }
-
-
-
