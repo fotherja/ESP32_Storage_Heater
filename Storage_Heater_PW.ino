@@ -48,7 +48,7 @@
 #define THERMISTORNOMINAL         10000
 #define TEMPERATURENOMINAL        25 
 
-#define MIN_Pump_Startup          440
+#define MIN_Pump_Startup          460
 #define STARTUP_WATER_FLOW_RATE   40
 
 #define TWENTY_SECONDS            200
@@ -66,8 +66,8 @@
 #define Fan_PWM_Ch                0
 #define Pump_PWM_Ch               1
 
-#define WATER_SETPOINT            82.0
-#define AIR_SETPOINT              15.0
+#define WATER_SETPOINT            85.0
+#define AIR_SETPOINT              16.0
 #define AIR_SETPOINT_SLEEP        5.0  
 
 //--------------------------------------
@@ -192,10 +192,10 @@ void loop() {
   // ---------------------------------------------------------------------------------
   if(Heater_MODE == HEAT_UP_TIME && Temperature_Reached_Count < FIVE_MINUTES)         // If it's heat up time - Simply PI control pump speed to obtain water setpoint temp.
   {
-    if(Measured_Water_Temp > 90.0) {                                                  // If the water out temp gets too hot
+    if(Measured_Water_Temp > 92.0) {                                                  // If the water out temp gets too hot
       digitalWrite(L298_Relay_Pin, LOW);                                              // This switches off the immersion heater in an overheat situation
     }   
-    else if (Measured_Water_Temp < 85.0)  {
+    else if (Measured_Water_Temp < 88.0)  {
       digitalWrite(L298_Relay_Pin, HIGH);                                             // This switches on the immersion heater 
     }
 
@@ -206,9 +206,14 @@ void loop() {
     Water_flow_rate = STARTUP_WATER_FLOW_RATE;                                        // Reset this for when we enter heat release mode.
   
     Heat_up_Pump_PI.Compute();                                                        // Iterate the PI controller based on the water output temp and setpoint. 
-    ledcWrite(Pump_PWM_Ch, round(Pump_Speed));                                        // Update the pump speed based on the PI controller   
+    if(Measured_Water_Temp > 88.0) {
+      ledcWrite(Pump_PWM_Ch, MIN_Pump_Startup);                                       // The pump may not have turned on, so this should get it started!
+    }
+    else {
+      ledcWrite(Pump_PWM_Ch, round(Pump_Speed));                                      // Update the pump speed based on the PI controller   
+    }
 
-    if(Air_Out_Temp > 45 || Measured_Water_Temp > 84)  {                              // Air_Out_Temp approximates the pump input temperature. (Don't want this too hot)
+    if(Air_Out_Temp > 45 || Measured_Water_Temp > 86)  {                              // Air_Out_Temp approximates the pump input temperature. (Don't want this too hot)
       Temperature_Reached_Count++;                                                    // If this is above threshold for xx seconds then assume we have charged the tank
     }
     else  {
@@ -248,7 +253,7 @@ void loop() {
 
     // State 2) Moderately warm tank - can modulate pump speed to maintain a fixed air differential temperature
     else if(Water_flow_rate > 288.0 && On_Count > Timer_Count)  {                     // Tank must be medium temperature (pump must already be on to switch into this state)
-      ledcWrite(Fan_PWM_Ch, 430);                                                     // Medium fan speed                                   
+      ledcWrite(Fan_PWM_Ch, 440);                                                     // Medium fan speed                                   
       ledcWrite(Pump_PWM_Ch, round(Water_flow_rate));                                 // Can run pump slowly but continuously. Vary speed to maintain air differential temp
 
       if(Water_flow_rate > 303.9)  {                                                                  
@@ -264,7 +269,7 @@ void loop() {
       Timer_Count++;
       if(Timer_Count >= TWENTY_SECONDS)  {
         ledcWrite(Pump_PWM_Ch, MIN_Pump_Startup);
-        ledcWrite(Fan_PWM_Ch, 440);
+        ledcWrite(Fan_PWM_Ch, 450);
         Serial.println("P On Boost");
         Timer_Count = 0;
       }
@@ -276,7 +281,7 @@ void loop() {
         Serial.println("P On");
       }
       else  {
-        ledcWrite(Fan_PWM_Ch, 434);                                                   // When the pump stops the supply voltage slightly rises so this compensates
+        ledcWrite(Fan_PWM_Ch, 444);                                                   // When the pump stops the supply voltage slightly rises so this compensates
         ledcWrite(Pump_PWM_Ch, 0);
         Serial.println("P Off");
       }
