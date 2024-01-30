@@ -66,7 +66,7 @@
 #define Fan_PWM_Ch                0
 #define Pump_PWM_Ch               1
 
-#define WATER_SETPOINT            85.0
+#define WATER_SETPOINT            83.0
 #define AIR_SETPOINT              16.0
 #define AIR_SETPOINT_SLEEP        5.0  
 
@@ -102,7 +102,7 @@ void setup() {
   Heat_up_Pump_PI.SetOutputLimits(288,480);   
   Heat_up_Pump_PI.SetSampleTime(200);
   Setpoint_Water_Temp = WATER_SETPOINT;
-  Pump_Speed = MIN_Pump_Startup;  
+  Pump_Speed = 480;  
 
   Heat_release_Pump_PI.SetOutputLimits(16,304);
   Heat_release_Pump_PI.SetSampleTime(200);
@@ -159,7 +159,10 @@ void loop() {
     Serial.println(&timeinfo, "%H:%M");
     Setpoint_Air_Differential = AIR_SETPOINT_SLEEP;
     
-    if(timeinfo.tm_hour == 0 && timeinfo.tm_min >= 30) {
+    if(timeinfo.tm_hour == 0 && timeinfo.tm_min == 29) {
+      Pump_Speed = 480;
+    }
+    else if(timeinfo.tm_hour == 0 && timeinfo.tm_min >= 30) {
       Heater_MODE = HEAT_UP_TIME;
     }
     else if(timeinfo.tm_hour == 1 || timeinfo.tm_hour == 2 || timeinfo.tm_hour == 3)  {
@@ -192,10 +195,10 @@ void loop() {
   // ---------------------------------------------------------------------------------
   if(Heater_MODE == HEAT_UP_TIME && Temperature_Reached_Count < FIVE_MINUTES)         // If it's heat up time - Simply PI control pump speed to obtain water setpoint temp.
   {
-    if(Measured_Water_Temp > 92.0) {                                                  // If the water out temp gets too hot
+    if(Measured_Water_Temp > 88.0) {                                                  // If the water out temp gets too hot
       digitalWrite(L298_Relay_Pin, LOW);                                              // This switches off the immersion heater in an overheat situation
     }   
-    else if (Measured_Water_Temp < 88.0)  {
+    else if (Measured_Water_Temp < 86.0)  {
       digitalWrite(L298_Relay_Pin, HIGH);                                             // This switches on the immersion heater 
     }
 
@@ -206,12 +209,7 @@ void loop() {
     Water_flow_rate = STARTUP_WATER_FLOW_RATE;                                        // Reset this for when we enter heat release mode.
   
     Heat_up_Pump_PI.Compute();                                                        // Iterate the PI controller based on the water output temp and setpoint. 
-    if(Measured_Water_Temp > 88.0) {
-      ledcWrite(Pump_PWM_Ch, MIN_Pump_Startup);                                       // The pump may not have turned on, so this should get it started!
-    }
-    else {
-      ledcWrite(Pump_PWM_Ch, round(Pump_Speed));                                      // Update the pump speed based on the PI controller   
-    }
+    ledcWrite(Pump_PWM_Ch, round(Pump_Speed));                                        // Update the pump speed based on the PI controller   
 
     if(Air_Out_Temp > 45 || Measured_Water_Temp > 86)  {                              // Air_Out_Temp approximates the pump input temperature. (Don't want this too hot)
       Temperature_Reached_Count++;                                                    // If this is above threshold for xx seconds then assume we have charged the tank
@@ -269,7 +267,7 @@ void loop() {
       Timer_Count++;
       if(Timer_Count >= TWENTY_SECONDS)  {
         ledcWrite(Pump_PWM_Ch, MIN_Pump_Startup);
-        ledcWrite(Fan_PWM_Ch, 450);
+        ledcWrite(Fan_PWM_Ch, 460);
         Serial.println("P On Boost");
         Timer_Count = 0;
       }
@@ -281,7 +279,7 @@ void loop() {
         Serial.println("P On");
       }
       else  {
-        ledcWrite(Fan_PWM_Ch, 444);                                                   // When the pump stops the supply voltage slightly rises so this compensates
+        ledcWrite(Fan_PWM_Ch, 454);                                                   // When the pump stops the supply voltage slightly rises so this compensates
         ledcWrite(Pump_PWM_Ch, 0);
         Serial.println("P Off");
       }
