@@ -66,8 +66,8 @@
 #define Fan_PWM_Ch                0
 #define Pump_PWM_Ch               1
 
-#define WATER_SETPOINT            83.0
-#define AIR_SETPOINT              16.0
+#define WATER_SETPOINT            82.0
+#define AIR_SETPOINT              15.0
 #define AIR_SETPOINT_SLEEP        5.0  
 
 //--------------------------------------
@@ -85,7 +85,7 @@ MovingAverage <uint16_t, 8> Air_Out_Temp_Filter;
 MovingAverage <uint16_t, 8> Water_Out_Temp_Filter;
 
 double    Setpoint_Water_Temp, Measured_Water_Temp, Pump_Speed;
-double    Pump_Kp=4.0, Pump_Ki=0.05, Pump_Kd=0.0;
+double    Pump_Kp=1.0, Pump_Ki=0.05, Pump_Kd=0.0;
 PID       Heat_up_Pump_PI(&Measured_Water_Temp, &Pump_Speed, &Setpoint_Water_Temp, Pump_Kp, Pump_Ki, Pump_Kd, REVERSE);
 
 double    Setpoint_Air_Differential, Air_Differential, Water_flow_rate;
@@ -99,10 +99,10 @@ Point           sensor("Storage_Heater");
 //#########################################################################################################################################################################
 //-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void setup() {
-  Heat_up_Pump_PI.SetOutputLimits(288,480);   
+  Heat_up_Pump_PI.SetOutputLimits(300,480);   
   Heat_up_Pump_PI.SetSampleTime(200);
   Setpoint_Water_Temp = WATER_SETPOINT;
-  Pump_Speed = 480;  
+  Pump_Speed = MIN_Pump_Startup;  
 
   Heat_release_Pump_PI.SetOutputLimits(16,304);
   Heat_release_Pump_PI.SetSampleTime(200);
@@ -113,7 +113,7 @@ void setup() {
 
   // Init and get the time
   initTime("GMT0BST,M3.5.0/1,M10.5.0"); 
-  //setTime(2022, 11, 4, 4, 20, 0, 0);  
+  //setTime(2022, 11, 4, 0, 29, 0, 0);  
 
   // Configure Pins
   pinMode(L298_Enable_Pin, OUTPUT);
@@ -159,8 +159,10 @@ void loop() {
     Serial.println(&timeinfo, "%H:%M");
     Setpoint_Air_Differential = AIR_SETPOINT_SLEEP;
     
-    if(timeinfo.tm_hour == 0 && timeinfo.tm_min == 29) {
-      Pump_Speed = 480;
+    if(timeinfo.tm_hour == 0 && (timeinfo.tm_min == 30 || timeinfo.tm_min == 31)) {
+      Pump_Speed = MIN_Pump_Startup;
+      Heat_up_Pump_PI.SetMode(MANUAL);
+      Heater_MODE = HEAT_UP_TIME;
     }
     else if(timeinfo.tm_hour == 0 && timeinfo.tm_min >= 30) {
       Heater_MODE = HEAT_UP_TIME;
@@ -187,7 +189,7 @@ void loop() {
 
   // Every 1 minute, log our metrics to an influx database on a server on the local network
   Log_Data_Count++;
-  if(Log_Data_Count >= ONE_MINUTE)  {
+  if(Log_Data_Count >= TWENTY_SECONDS)  {
     Log_Data_Count = 0;
     Save_Influx_Point(Air_In_Temp, Air_Out_Temp, Measured_Water_Temp, Avg_Water_flow_rate);
   }  
@@ -195,20 +197,20 @@ void loop() {
   // ---------------------------------------------------------------------------------
   if(Heater_MODE == HEAT_UP_TIME && Temperature_Reached_Count < FIVE_MINUTES)         // If it's heat up time - Simply PI control pump speed to obtain water setpoint temp.
   {
-    if(Measured_Water_Temp > 88.0) {                                                  // If the water out temp gets too hot
+    if(Measured_Water_Temp > 89.0) {                                                  // If the water out temp gets too hot
       digitalWrite(L298_Relay_Pin, LOW);                                              // This switches off the immersion heater in an overheat situation
     }   
-    else if (Measured_Water_Temp < 86.0)  {
+    else if (Measured_Water_Temp < 88.0)  {
       digitalWrite(L298_Relay_Pin, HIGH);                                             // This switches on the immersion heater 
     }
 
-    Heat_up_Pump_PI.SetMode(AUTOMATIC);
     Heat_release_Pump_PI.SetMode(MANUAL);
     ledcWrite(Fan_PWM_Ch, 432);                                                       // fan to allow for pump input temp to be approximated and to cool enclosure
     Heat_Depleted_Count = 0;
     Water_flow_rate = STARTUP_WATER_FLOW_RATE;                                        // Reset this for when we enter heat release mode.
   
     Heat_up_Pump_PI.Compute();                                                        // Iterate the PI controller based on the water output temp and setpoint. 
+    Heat_up_Pump_PI.SetMode(AUTOMATIC);
     ledcWrite(Pump_PWM_Ch, round(Pump_Speed));                                        // Update the pump speed based on the PI controller   
 
     if(Air_Out_Temp > 45 || Measured_Water_Temp > 86)  {                              // Air_Out_Temp approximates the pump input temperature. (Don't want this too hot)
